@@ -1,0 +1,16 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+algorithm:
+  sentence_judge:
+    enable: True
+    prompt_template_path: "recipe/sj-grpo/template/sj_grpo_judge_prompt_template.txt"
+    adv_mask_apply_stage: "after_adv" # "token_level" or "after_adv"
+
+trainer:
+  project_name: verl-sj-grpo
