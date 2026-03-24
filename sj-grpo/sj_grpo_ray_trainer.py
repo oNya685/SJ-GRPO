@@ -296,6 +296,15 @@ class RaySJGRPOTrainer(RayPPOTrainer):
                     # SJ-GRPO FEAT
                     if self.config.algorithm.sentence_judge.enable:
                         with marked_timer("sentence_judge", timing_raw, color="green"):
+                            # To be verified:
+                            # batch.batch.keys() includes: input_ids, attention_mask, response_mask, old_log_probs, rm_scores, reward_baselines (if REMAX), values (if critic), multi_modal_inputs (if any), etc.
+                            # batch.non_tensor_batch.keys() includes: uid, raw_prompts, multi_modal_inputs
+                            # batch.meta_info.keys() includes: temperature, global_token_num, images_seqlens, etc.
+                            breakpoint()
+                            print(batch.batch.keys())
+                            print(batch.non_tensor_batch.keys())
+                            print(batch.meta_info.keys())
+
                             # TODO: step 1: parse "<system><user><cot><output>"
                             # future: parse "<system>{(<user>|<tool_call>)<cot><output>{<tool_call>})}+"
 
