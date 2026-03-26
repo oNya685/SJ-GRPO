@@ -31,7 +31,7 @@ from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
 from verl.trainer.main_ppo import run_ppo, TaskRunner, create_rl_dataset, create_rl_sampler
 
-from sj_grpo_ray_trainer import RaySJGRPOTrainer
+from .sj_grpo_ray_trainer import RaySJGRPOTrainer
 
 
 @hydra.main(config_path="config", config_name="sj_grpo_trainer", version_base=None)

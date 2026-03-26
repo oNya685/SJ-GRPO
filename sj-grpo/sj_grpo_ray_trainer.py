@@ -67,6 +67,9 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_response_mask, compute_advantage, RayPPOTrainer
 
+from .segmenter import segment
+from .template import judge_template
+
 class RaySJGRPOTrainer(RayPPOTrainer):
     def fit(self):
         """
@@ -308,6 +311,9 @@ class RaySJGRPOTrainer(RayPPOTrainer):
                             # TODO: step 1: parse "<system><user><cot><output>"
                             # future: parse "<system>{(<user>|<tool_call>)<cot><output>{<tool_call>})}+"
 
+                            responses = batch.batch["responses"]
+                            chunks_info_list = segment(responses)
+
                             # TODO: step 2: split "<cot><output>" into sentences 
                             #               "{'<|sentence id begin|><sentence><|sentence id end|>}+"
                             #               and sentence_id_mask like response_mask \in SENTENCE_IDS: uint
@@ -321,17 +327,46 @@ class RaySJGRPOTrainer(RayPPOTrainer):
                                 # user: Question: {question}
                                 #       Answer: {sentences}
                                 #       Result: {to_readable_str(reward)}
+                            judge_inputs = judge_template(batch.batch["prompts"], chunks_info_list, batch.batch["rm_scores"])
 
                             # TODO: step 4: generate seqences
+                            judge_outputs = self.async_rollout_manager.generate_sequences(judge_inputs)
 
-                            # TODO: step 5: parse LLM output into dict 
-                            #               {SENTENCE_ID: uint -> ADV_RATIO: float \in [0, 1]}
+                            adv_mask = []
+                            for batch_idx in range(len(batch_size)):
+                                # TODO: step 5: parse LLM output into dict 
+                                #               {SENTENCE_ID: uint -> ADV_RATIO: float \in [0, 1]}
+                                try:
+                                    judge_output = self.tokenizer.decode(judge_outputs[batch_idx]["responses"], skip_special_tokens=True)
+                                    judge_result_dict = json.loads(judge_output)
+                                except json.JSONDecodeError:
+                                    print(f"Failed to decode judge output for {batch_idx}: {judge_output}")
+                                    adv_mask.append([1.0] * len(batch.batch["responses"][batch_idx])) # fallback to all unimportant
 
-                            # TODO: step 6: generate adv_mask by mapping sentence_id_mask in dict
+                                judge_results = {0: 0.8, 1: 0.3}
 
+                                # TODO: step 6: generate adv_mask by mapping sentence_id_mask in dict
+                                for chunk_idx, chunk in enumerate(chunks_info_list[batch_idx]):
+                                    chunk["adv_ratio"] = judge_results.get(chunk_idx, 0)
+                                
+                                token_spans = get_token_char_spans(batch.batch["responses"], self.tokenizer)
+                                item_adv_mask = [0.0] * len(batch.batch["responses"][batch_idx])
+                                for token_idx, (token_start, token_end) in enumerate(token_spans):
+                                    if token_start == token_end:
+                                        continue # 处理空 Token（如特殊 token 被 skip）
+                                    token_center = (token_start + token_end) / 2.0  # 取 token 中心点
+                                    
+                                    # 寻找该 token 落在了哪个 chunk 里面
+                                    for chunk in chunks_info_list[batch_idx]:
+                                        if chunk["start"] <= token_center <= chunk["end"]:
+                                            item_adv_mask[token_idx] = chunk["adv_ratio"]
+                                            break
+                                adv_mask.append(item_adv_mask)
+
+                            # 转为张量并推到 GPU，供后续使用
+                            adv_mask_tensor = torch.tensor(adv_mask, dtype=torch.float32, device=batch["advantages"].device)
                             # TODO: step 7: update metrics and output sample
-                            
-                            pass
+
                     else:        
                         adv_mask = None
 
