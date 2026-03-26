@@ -1,5 +1,5 @@
 # Discliamer: the model used in the script is only for academic purpose.
-hf auth login
+# hf auth login
 
 set -x
 
@@ -8,15 +8,15 @@ set -x
 #
 #   python3 examples/data_preprocess/math_dataset.py --local_dir data/math
 
-math_train_path=$HOME/data/math/train.parquet
-math_test_path=$HOME/data/math/test.parquet
+math_train_path=data/math/train.parquet
+math_test_path=data/math/test.parquet
 
 train_files="['$math_train_path']"
 test_files="['$math_test_path']"
 
 # prepare model ckpt
-hf download Qwen/Qwen3-4B-Instruct --local-dir huggingface.co/Qwen/Qwen3-4B-Instruct &
-wait
+# hf download Qwen/Qwen3-4B-Instruct --local-dir huggingface.co/Qwen/Qwen3-4B-Instruct &
+# wait
 
 python3 -m recipe.sj-grpo.sj_grpo_main_ppo \
     data.train_files="$train_files" \
@@ -37,12 +37,13 @@ python3 -m recipe.sj-grpo.sj_grpo_main_ppo \
     actor_rollout_ref.rollout.name=vllm  \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.fsdp_config.param_offload=False \
+    algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     trainer.logger='["console","tensorboard"]' \
     trainer.project_name='sj-grpo-vllm' \
     trainer.val_before_train=True \
     trainer.experiment_name='Qwen3-4B-Instruct_debug' \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=1 \
