@@ -70,6 +70,24 @@ from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_response_mask
 from .segmenter import segment
 from .template import judge_template
 
+
+def find_token_idx_for_char_idx(token_ids: list[int], char_idx: int, tokenizer) -> int:
+    """
+    通过二分查找，寻找第一个使得 解码后字符串长度 >= char_idx 的 Token 索引。
+    复杂度: O(log N) 次 decode
+    """
+    low, high = 0, len(token_ids)
+    ans = high
+    while low <= high:
+        mid = (low + high) // 2
+        text = tokenizer.decode(token_ids[:mid], skip_special_tokens=True)
+        if len(text) >= char_idx:
+            ans = mid
+            high = mid - 1  # 满足条件，继续向左尝试，以防有不占长度的特殊Token
+        else:
+            low = mid + 1
+    return ans
+
 class RaySJGRPOTrainer(RayPPOTrainer):
     def fit(self):
         """
@@ -299,20 +317,13 @@ class RaySJGRPOTrainer(RayPPOTrainer):
                     # SJ-GRPO FEAT
                     if self.config.algorithm.sentence_judge.enable:
                         with marked_timer("sentence_judge", timing_raw, color="green"):
-                            # To be verified:
-                            # batch.batch.keys() includes: input_ids, attention_mask, response_mask, old_log_probs, rm_scores, reward_baselines (if REMAX), values (if critic), multi_modal_inputs (if any), etc.
-                            # batch.non_tensor_batch.keys() includes: uid, raw_prompts, multi_modal_inputs
-                            # batch.meta_info.keys() includes: temperature, global_token_num, images_seqlens, etc.
-                            breakpoint()
-                            print(batch.batch.keys())
-                            print(batch.non_tensor_batch.keys())
-                            print(batch.meta_info.keys())
-
+                            # breakpoint()
                             # TODO: step 1: parse "<system><user><cot><output>"
                             # future: parse "<system>{(<user>|<tool_call>)<cot><output>{<tool_call>})}+"
-
-                            responses = batch.batch["responses"]
-                            chunks_info_list = segment(responses)
+                            _prompts = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+                            _responses = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+                            _scores = batch.batch["rm_scores"].sum(dim=1)
+                            _chunks_info_list = segment(_responses)
 
                             # TODO: step 2: split "<cot><output>" into sentences 
                             #               "{'<|sentence id begin|><sentence><|sentence id end|>}+"
@@ -327,44 +338,47 @@ class RaySJGRPOTrainer(RayPPOTrainer):
                                 # user: Question: {question}
                                 #       Answer: {sentences}
                                 #       Result: {to_readable_str(reward)}
-                            judge_inputs = judge_template(batch.batch["prompts"], chunks_info_list, batch.batch["rm_scores"])
+                            _judge_prompts = judge_template(self.tokenizer, _prompts, _chunks_info_list, _scores)
+                            _judge_prompt_ids = self.tokenizer(_judge_prompts, return_tensors="pt")["input_ids"]
+                            # 方法 1：直接创建新实例（推荐）
+                            _judge_batch = DataProto(
+                                batch=batch.batch.copy(),  # TensorDict 浅拷贝
+                                non_tensor_batch=batch.non_tensor_batch.copy(),  # dict 浅拷贝
+                                meta_info=batch.meta_info.copy()  # dict 浅拷贝
+                            )
+
+                            # 然后替换 prompts
+                            _judge_batch.batch["prompts"] = _judge_prompt_ids
 
                             # TODO: step 4: generate seqences
-                            judge_outputs = self.async_rollout_manager.generate_sequences(judge_inputs)
+                            judge_outputs = self.async_rollout_manager.generate_sequences(_judge_batch)
 
-                            adv_mask = []
-                            for batch_idx in range(len(batch_size)):
+                            adv_mask_list = []
+                            for batch_idx in range(len(judge_outputs.batch["responses"].shape[0])):
                                 # TODO: step 5: parse LLM output into dict 
                                 #               {SENTENCE_ID: uint -> ADV_RATIO: float \in [0, 1]}
                                 try:
-                                    judge_output = self.tokenizer.decode(judge_outputs[batch_idx]["responses"], skip_special_tokens=True)
+                                    judge_output = self.tokenizer.batch_decode(judge_outputs[batch_idx]["responses"], skip_special_tokens=True)
                                     judge_result_dict = json.loads(judge_output)
                                 except json.JSONDecodeError:
                                     print(f"Failed to decode judge output for {batch_idx}: {judge_output}")
-                                    adv_mask.append([1.0] * len(batch.batch["responses"][batch_idx])) # fallback to all unimportant
-
-                                judge_results = {0: 0.8, 1: 0.3}
+                                    adv_mask_list.append(torch.ones_like(batch.batch["response_mask"][batch_idx], dtype=torch.float32)) # fallback to all unimportant
 
                                 # TODO: step 6: generate adv_mask by mapping sentence_id_mask in dict
-                                for chunk_idx, chunk in enumerate(chunks_info_list[batch_idx]):
-                                    chunk["adv_ratio"] = judge_results.get(chunk_idx, 0)
-                                
-                                token_spans = get_token_char_spans(batch.batch["responses"], self.tokenizer)
-                                item_adv_mask = [0.0] * len(batch.batch["responses"][batch_idx])
-                                for token_idx, (token_start, token_end) in enumerate(token_spans):
-                                    if token_start == token_end:
-                                        continue # 处理空 Token（如特殊 token 被 skip）
-                                    token_center = (token_start + token_end) / 2.0  # 取 token 中心点
-                                    
-                                    # 寻找该 token 落在了哪个 chunk 里面
-                                    for chunk in chunks_info_list[batch_idx]:
-                                        if chunk["start"] <= token_center <= chunk["end"]:
-                                            item_adv_mask[token_idx] = chunk["adv_ratio"]
-                                            break
-                                adv_mask.append(item_adv_mask)
+                                response_ids = batch.batch["responses"][batch_idx].tolist()
+                                item_adv_mask = [1.0] * len(response_ids)
+
+                                for chunk_idx, chunk in enumerate(_chunks_info_list[batch_idx]):
+                                    adv_ratio = judge_result_dict.get(chunk_idx, 1.0)
+                                    start_tok_idx = find_token_idx_for_char_idx(response_ids, chunk["start"], self.tokenizer)
+                                    end_tok_idx = find_token_idx_for_char_idx(response_ids, chunk["end"], self.tokenizer)
+                                    for t_idx in range(start_tok_idx, end_tok_idx):
+                                        item_adv_mask[t_idx] = adv_ratio
+
+                                adv_mask_list.append(torch.tensor(item_adv_mask, dtype=torch.float32))
 
                             # 转为张量并推到 GPU，供后续使用
-                            adv_mask_tensor = torch.tensor(adv_mask, dtype=torch.float32, device=batch["advantages"].device)
+                            adv_mask = torch.stack(adv_mask_list).to(batch.batch["rm_scores"].device)
                             # TODO: step 7: update metrics and output sample
 
                     else:        
@@ -432,7 +446,7 @@ class RaySJGRPOTrainer(RayPPOTrainer):
                             and self.config.algorithm.sentence_judge.adv_mask_apply_stage == "after_adv":
                             assert adv_mask is not None, "adv_mask is None but sentence_judge is enabled, \
                                 please check the implementation of sentence judge module"
-                            batch["advantages"] = batch["advantages"] * adv_mask
+                            batch.batch["advantages"] = batch.batch["advantages"] * adv_mask
 
                     # update critic
                     if self.use_critic:

@@ -85,3 +85,40 @@ class Segmenter:
 def segment(texts: list[str]) -> list[list[dict[str, Any]]]:
     segmenter = Segmenter()
     return [segmenter.segment(text) for text in texts]
+
+def get_token_char_spans(token_ids: list[int], tokenizer) -> list[tuple[int, int]]:
+    """
+    输入: token ID 列表
+    输出: [(start_char_idx, end_char_idx), ...] 长度等于 token 数量
+    """
+    # 构造逐级递增的前缀序列 [token0], [token0, token1], ...
+    prefix_ids = [token_ids[:i] for i in range(1, len(token_ids) + 1)]
+    
+    # 批量解码
+    decoded_prefixes = tokenizer.batch_decode(prefix_ids, skip_special_tokens=True)
+    
+    spans =[]
+    prev_len = 0
+    for text in decoded_prefixes:
+        curr_len = len(text)
+        spans.append((prev_len, curr_len))
+        prev_len = curr_len
+        
+    return spans
+
+def find_token_idx_for_char_idx(token_ids: list[int], char_idx: int, tokenizer) -> int:
+    """
+    通过二分查找，寻找第一个使得 解码后字符串长度 >= char_idx 的 Token 索引。
+    复杂度: O(log N) 次 decode
+    """
+    low, high = 0, len(token_ids)
+    ans = high
+    while low <= high:
+        mid = (low + high) // 2
+        text = tokenizer.decode(token_ids[:mid], skip_special_tokens=True)
+        if len(text) >= char_idx:
+            ans = mid
+            high = mid - 1  # 满足条件，继续向左尝试，以防有不占长度的特殊Token
+        else:
+            low = mid + 1
+    return ans
